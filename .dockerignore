@@ -1,0 +1,8 @@
+.git
+.gitignore
+arena/*
+!arena/.gitkeep
+keys/*
+!keys/.gitkeep
+tests
+README.md

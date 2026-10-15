@@ -1,0 +1,158 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "bashgame-entrypoint must run as root" >&2
+    exit 1
+fi
+
+if [ ! -d /keys ]; then
+    echo "Missing /keys directory; mount a directory of player .pub keys" >&2
+    exit 1
+fi
+
+groupadd --force players
+install -d -o root -g players -m 2770 /arena
+install -d -o root -g players -m 2770 /var/lib/bashgame
+install -d -o root -g root -m 0755 /var/lib/bashgame/players
+chown root:players /var/lib/bashgame
+chmod 2770 /var/lib/bashgame
+rm -f /var/lib/bashgame/players/*.sha256
+if [ ! -s /var/lib/bashgame/admin.password ]; then
+    umask 077
+    python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > /var/lib/bashgame/admin.password
+    chmod 0600 /var/lib/bashgame/admin.password
+    echo "Dashboard admin password (save this value): $(cat /var/lib/bashgame/admin.password)"
+fi
+
+validate_player_key() {
+    key_file=$1
+    file_name=${key_file##*/}
+    username=${file_name%.pub}
+
+    case "$username" in
+        ''|*[!a-z0-9_-]*|[!a-z]*)
+            echo "Invalid player key filename: $file_name (use a-z, 0-9, _ or -; start with a-z)" >&2
+            return 1
+            ;;
+    esac
+    if [ "${#username}" -gt 32 ]; then
+        echo "Invalid player name '$username': maximum length is 32 characters" >&2
+        return 1
+    fi
+    if ! ssh-keygen -lf "$key_file" >/dev/null 2>&1; then
+        echo "Invalid SSH public key: $key_file" >&2
+        return 1
+    fi
+}
+
+configured_player_count=0
+for key_file in /keys/*.pub; do
+    [ -f "$key_file" ] || continue
+    validate_player_key "$key_file"
+    configured_player_count=$((configured_player_count + 1))
+done
+if [ "$configured_player_count" -lt 2 ]; then
+    echo "Add at least two players by placing valid <player>.pub files in ./keys" >&2
+    exit 1
+fi
+
+PYTHONPATH=/usr/local/bin python3 - <<'PY'
+from game_state import clear_arena
+
+clear_arena()
+PY
+
+player_count=0
+for key_file in /keys/*.pub; do
+    [ -f "$key_file" ] || continue
+    validate_player_key "$key_file"
+    file_name=${key_file##*/}
+    username=${file_name%.pub}
+
+    if id "$username" >/dev/null 2>&1; then
+        if [ "$(id -gn "$username")" != players ]; then
+            echo "Player name '$username' conflicts with an existing system account" >&2
+            exit 1
+        fi
+        usermod --home "/home/$username" --shell /bin/bash --gid players "$username"
+    else
+        useradd --create-home --home-dir "/home/$username" --shell /bin/bash --gid players "$username"
+    fi
+    passwd --delete "$username" >/dev/null
+    install -d -o "$username" -g players -m 0700 "/home/$username/.ssh"
+    install -o "$username" -g players -m 0600 "$key_file" "/home/$username/.ssh/authorized_keys"
+
+    python3 - "$username" <<'PY'
+import hashlib
+import os
+import pwd
+import secrets
+import sys
+
+username = sys.argv[1]
+account = pwd.getpwnam(username)
+token = secrets.token_hex(32).encode("ascii")
+token_path = f"/arena/{username}.flag"
+fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660)
+with os.fdopen(fd, "wb") as token_file:
+    token_file.write(token)
+os.chown(token_path, account.pw_uid, account.pw_gid)
+os.chmod(token_path, 0o660)
+
+digest_path = f"/var/lib/bashgame/players/{username}.sha256"
+with open(digest_path, "w", encoding="ascii") as digest_file:
+    digest_file.write(hashlib.sha256(token).hexdigest())
+os.chmod(digest_path, 0o444)
+PY
+
+    player_count=$((player_count + 1))
+done
+
+if [ "$player_count" -lt 2 ]; then
+    echo "Add at least two players by placing valid <player>.pub files in ./keys" >&2
+    exit 1
+fi
+
+PYTHONPATH=/usr/local/bin python3 - <<'PY'
+from pathlib import Path
+
+from game_state import initialize_database
+
+state_dir = Path("/var/lib/bashgame/players")
+player_names = sorted(path.name.removesuffix(".sha256") for path in state_dir.glob("*.sha256"))
+initialize_database(player_names)
+PY
+chown root:players /var/lib/bashgame/scores.sqlite3
+chmod 0660 /var/lib/bashgame/scores.sqlite3
+
+ssh-keygen -A
+if ! /usr/sbin/sshd -t; then
+    echo "OpenSSH server configuration is invalid" >&2
+    exit 1
+fi
+
+python3 /usr/local/bin/bashgame_dashboard.py &
+dashboard_pid=$!
+sleep 1
+if ! kill -0 "$dashboard_pid" 2>/dev/null; then
+    echo "Bashgame dashboard failed to start" >&2
+    wait "$dashboard_pid"
+    exit 1
+fi
+
+/usr/sbin/sshd -D -e &
+sshd_pid=$!
+cleanup() {
+    kill "$sshd_pid" "$dashboard_pid" 2>/dev/null || true
+    wait "$sshd_pid" 2>/dev/null || true
+    wait "$dashboard_pid" 2>/dev/null || true
+}
+trap cleanup INT TERM
+
+echo "Starting Bashgame for $player_count players on SSH port 22 and dashboard port 8080"
+status=0
+wait "$sshd_pid" || status=$?
+kill "$dashboard_pid" 2>/dev/null || true
+wait "$dashboard_pid" 2>/dev/null || true
+exit "$status"

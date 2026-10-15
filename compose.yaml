@@ -1,0 +1,10 @@
+services:
+  bashgame:
+    build: .
+    ports:
+      - "2222:22"
+      - "8080:8080"
+    volumes:
+      - ./keys:/keys:ro
+      - ./arena:/arena
+    restart: unless-stopped

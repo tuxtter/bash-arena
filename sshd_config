@@ -1,0 +1,17 @@
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+PermitRootLogin no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+PermitTTY yes
+DisableForwarding yes
+X11Forwarding no
+PermitUserEnvironment no
+ForceCommand /usr/local/bin/bashgame-shell
+LogLevel VERBOSE
