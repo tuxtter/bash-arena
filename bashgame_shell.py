@@ -24,15 +24,15 @@ STATE_DIR = Path("/var/lib/bashgame/players")
 POLL_INTERVAL = 0.1
 CURRENT_DIR = ()
 WILDCARD_CHARS = frozenset("*?[]")
-ANSI_RESET = "\033[0m"
+ANSI_RESET = "\x1b[0m"
 ANSI_COLORS = {
-    "red": "\033[31m",
-    "green": "\033[32m",
-    "yellow": "\033[33m",
-    "blue": "\033[34m",
-    "magenta": "\033[35m",
-    "cyan": "\033[36m",
-    "bold": "\033[1m",
+    "red": "\x1b[31m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "blue": "\x1b[34m",
+    "magenta": "\x1b[35m",
+    "cyan": "\x1b[36m",
+    "bold": "\x1b[1m",
 }
 LOGO = (
     " ____  _____ ____  _   _  ____    _    __  __ _____ ",
@@ -317,12 +317,50 @@ def command_ls(args):
     else:
         path = resolve_path(args[0])
 
+    username = pwd.getpwuid(os.getuid()).pw_name
+    
     if path == ARENA or path.is_dir():
         try:
-            names = sorted(entry.name for entry in os.scandir(path))
+            entries = sorted(os.scandir(path), key=lambda e: e.name)
         except OSError as exc:
             raise CommandError(f"cannot list directory: {exc.strerror}") from exc
-        print("  ".join(names))
+        
+        # List directory contents with colors
+        colored_entries = []
+        for entry in entries:
+            if entry.is_dir():
+                colored_name = f"{ANSI_COLORS['blue']}{entry.name}/{ANSI_RESET}"
+            else:
+                colored_name = entry.name
+            colored_entries.append(colored_name)
+        print("  ".join(colored_entries))
+        
+        # Check for and acquire powerups in this directory
+        powerup_descriptions = []
+        for entry in entries:
+            if entry.name.startswith("powerup_"):
+                try:
+                    with open(entry.path, "r") as f:
+                        power_up_type = f.read().strip()
+                    if power_up_type in game_state.POWERUP_TYPES:
+                        game_state.acquire_power_up(username, power_up_type)
+                        desc = game_state.POWERUP_TYPES[power_up_type]["description"]
+                        powerup_descriptions.append(f"⭐ {desc}")
+                except (OSError, game_state.GameStateError):
+                    pass
+        
+        if powerup_descriptions:
+            for desc in powerup_descriptions:
+                print(desc)
+        
+        # Show trapped players in this room
+        relative_path = str(path.relative_to(ARENA)) if path != ARENA else ""
+        try:
+            trapped = game_state.get_trapped_players(relative_path)
+            if trapped:
+                print(f"[🔒 Trapped players: {', '.join(trapped)}]")
+        except game_state.GameStateError:
+            pass
         return
 
     require_regular_file(path)
@@ -430,6 +468,13 @@ def command_cd(args):
     if len(args) > 1:
         raise CommandError("usage: cd [directory]")
     global CURRENT_DIR
+    
+    username = pwd.getpwuid(os.getuid()).pw_name
+    
+    # CHECK: If player is already trapped, don't allow movement anywhere
+    if game_state.is_player_trapped(username):
+        raise CommandError("🔒 You are TRAPPED in this room and cannot move! Wait for another player to enter and rescue you!")
+    
     if not args:
         CURRENT_DIR = ()
         return
@@ -439,6 +484,32 @@ def command_cd(args):
             raise CommandError(f"'{args[0]}' is not a directory")
     except OSError as exc:
         raise CommandError(f"cannot access '{args[0]}': {exc.strerror}") from exc
+    
+    # Update player location in database
+    relative_path = str(path.relative_to(ARENA)) if path != ARENA else ""
+    try:
+        game_state.update_player_location(username, relative_path)
+    except game_state.GameStateError:
+        pass  # Location tracking is best-effort
+    
+    # Check if this is a jail folder
+    if game_state.is_jail_folder(relative_path):
+        trapped_players = game_state.get_trapped_players(relative_path)
+        if trapped_players:
+            # Another player is trapped here - rescue them!
+            print(f"⭐ You entered a dangerous room and encountered trapped players!")
+            for trapped in trapped_players:
+                game_state.rescue_player(trapped)
+                print(f"🔓 {trapped} has been freed from the trap!")
+        else:
+            # You just got trapped!
+            game_state.trap_player(username, relative_path)
+            print(f"🔒 DANGER! You've entered a TRAP ROOM!")
+            print(f"You are now trapped in: {relative_path}")
+            print(f"💡 Tip: Another player must enter this room to free you!")
+            CURRENT_DIR = tuple(path.relative_to(ARENA).parts)
+            return
+    
     CURRENT_DIR = tuple(path.relative_to(ARENA).parts)
 
 
@@ -474,6 +545,57 @@ def command_touch(args):
                 raise CommandError(f"cannot create '{path.name}': {exc.strerror}") from exc
 
 
+def check_power_up(path, username):
+    """Check if a file is a power-up and acquire it if so."""
+    try:
+        if path.name.startswith("powerup_"):
+            with open(path, "r") as f:
+                power_up_type = f.read().strip()
+            if power_up_type in game_state.POWERUP_TYPES:
+                game_state.acquire_power_up(username, power_up_type)
+                description = game_state.POWERUP_TYPES[power_up_type]["description"]
+                return description
+    except (OSError, game_state.GameStateError):
+        pass
+    return None
+
+
+def command_interact(args):
+    """Acquire a power-up when player navigates to its directory."""
+    if args:
+        raise CommandError("usage: interact")
+    username = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        power_ups = game_state.get_active_power_ups(username)
+        if power_ups:
+            print("Active power-ups:")
+            for power_up_type in power_ups:
+                print(f"  {game_state.POWERUP_TYPES[power_up_type]['description']}")
+        else:
+            print("No active power-ups. Find powerup_* files to gain abilities!")
+    except game_state.GameStateError as exc:
+        raise CommandError(f"cannot check power-ups: {exc}") from exc
+
+
+def command_scan(args):
+    """Radar power-up: detect online players."""
+    if args:
+        raise CommandError("usage: scan")
+    username = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        if "radar" not in game_state.get_active_power_ups(username):
+            raise CommandError("radar power-up not active (find powerup_radar files)")
+        online_players = game_state.get_player_radar(username)
+        if online_players:
+            print(f"Detected {len(online_players)} online player(s):")
+            for player in sorted(online_players):
+                print(f"  - {player}")
+        else:
+            print("No other players online.")
+    except game_state.GameStateError as exc:
+        raise CommandError(f"cannot scan: {exc}") from exc
+
+
 def command_mv(args):
     if len(args) != 2:
         raise CommandError("usage: mv source destination")
@@ -484,17 +606,28 @@ def command_mv(args):
     if source == destination:
         return
 
+    username = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        victim = game_state.player_for_file(destination)
+        if victim and victim != username and game_state.is_shielded(victim):
+            raise CommandError(f"cannot move file onto {victim} - they are shielded by powerup!")
+    except game_state.GameStateError:
+        pass
+
     def move_file():
         os.replace(source, destination)
 
     try:
-        victim = game_state.mutate_and_score(
-            pwd.getpwuid(os.getuid()).pw_name, destination, move_file
-        )
+        victim = game_state.mutate_and_score(username, destination, move_file)
     except OSError as exc:
         raise CommandError(f"cannot move '{source.name}': {exc.strerror}") from exc
     if victim:
         print(f"You eliminated {victim}.")
+        
+    # Check for power-up pickup
+    powerup = check_power_up(source, username)
+    if powerup:
+        print(f"⭐ Power-up acquired: {powerup}")
 
 
 def command_rm(args):
@@ -504,13 +637,19 @@ def command_rm(args):
         path = resolve_path(name)
         require_regular_file(path)
 
+        username = pwd.getpwuid(os.getuid()).pw_name
+        try:
+            victim = game_state.player_for_file(path)
+            if victim and victim != username and game_state.is_shielded(victim):
+                raise CommandError(f"cannot remove '{victim}' - they are shielded by powerup!")
+        except game_state.GameStateError:
+            pass
+
         def remove_file():
             path.unlink()
 
         try:
-            victim = game_state.mutate_and_score(
-                pwd.getpwuid(os.getuid()).pw_name, path, remove_file
-            )
+            victim = game_state.mutate_and_score(username, path, remove_file)
         except OSError as exc:
             raise CommandError(f"cannot remove '{path.name}': {exc.strerror}") from exc
         if victim:
@@ -529,6 +668,43 @@ def command_exit(args):
     return False
 
 
+def command_status(args):
+    """Display current dungeon status and player status."""
+    if args:
+        raise CommandError("usage: status")
+    
+    username = pwd.getpwuid(os.getuid()).pw_name
+    
+    # Check if trapped
+    trapped_in = game_state.is_player_trapped(username)
+    if trapped_in:
+        print(f"🔒 STATUS: You are TRAPPED in {trapped_in or 'root'}")
+        print(f"   Wait for another player to enter this room to free you!")
+    else:
+        current_location = "/arena" + ("/" + "/".join(CURRENT_DIR) if CURRENT_DIR else "")
+        print(f"✓ STATUS: Free in {current_location}")
+    
+    # Show dungeon stats
+    try:
+        dungeon_map = game_state.get_dungeon_map_for_round()
+        print(f"\n📍 Dungeon Statistics:")
+        print(f"   Depth: {dungeon_map['depth']}")
+        print(f"   Width: {dungeon_map['width']}")
+        print(f"   Traps: {dungeon_map['total_jails']}")
+    except game_state.GameStateError:
+        pass
+    
+    # Show active power-ups
+    try:
+        powerups = game_state.get_active_power_ups(username)
+        if powerups:
+            print(f"\n⚡ Active Power-ups:")
+            for ptype, remaining in powerups:
+                print(f"   {ptype} ({remaining:.0f}s remaining)")
+    except game_state.GameStateError:
+        pass
+
+
 def reject_wildcards(words):
     if any(any(character in WILDCARD_CHARS for character in word) for word in words):
         raise CommandError("wildcards are not allowed")
@@ -544,6 +720,9 @@ COMMANDS = {
     "mkdir": command_mkdir,
     "mv": command_mv,
     "rm": command_rm,
+    "interact": command_interact,
+    "scan": command_scan,
+    "status": command_status,
     "exit": command_exit,
 }
 
@@ -606,7 +785,7 @@ def run_interactive_session(username, ui, lost_event, session_state):
                         handler = COMMANDS.get(command)
                         if handler is None:
                             raise CommandError(
-                                "command not allowed; use ls, tree, find, cd, pwd, touch, mkdir, mv, rm, or exit"
+                                "command not allowed; use ls, tree, find, cd, pwd, touch, mkdir, mv, rm, interact, scan, or exit"
                             )
                         should_exit = handler(args) is False
             except ValueError as exc:
@@ -675,7 +854,7 @@ def main():
                 command, *args = words
                 handler = COMMANDS.get(command)
                 if handler is None:
-                    raise CommandError("command not allowed; use ls, tree, find, cd, pwd, touch, mkdir, mv, rm, or exit")
+                    raise CommandError("command not allowed; use ls, tree, find, cd, pwd, touch, mkdir, mv, rm, interact, scan, or exit")
                 if handler(args) is False:
                     return 0
             except ValueError as exc:

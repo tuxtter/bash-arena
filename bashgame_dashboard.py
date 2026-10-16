@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import game_state
+import dungeon_viz
 
 ADMIN_PASSWORD_FILE = "/var/lib/bashgame/admin.password"
 
@@ -39,6 +40,8 @@ PAGE = """<!doctype html>
     #tree ul { list-style: none; margin: .35rem 0 0; padding-left: 1.25rem; }
     #tree > ul { padding-left: 0; }
     #tree li { padding: .2rem 0; }
+    #dungeon { padding: 1rem 1.25rem; background: #1f2937; border-radius: .75rem; font-family: 'Monaco', 'Courier New', monospace; font-size: .85rem; line-height: 1.4; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
+    #dungeon-map { padding: .75rem 0; color: #d1d5db; }
     button { padding: .65rem 1rem; border: 1px solid #7f1d1d; border-radius: .5rem; color: #fee2e2; background: #7f1d1d; cursor: pointer; }
     button.respawn { border-color: #065f46; color: #d1fae5; background: #065f46; }
     button:disabled { opacity: .6; cursor: wait; }
@@ -53,11 +56,14 @@ PAGE = """<!doctype html>
     <thead><tr><th>Player</th><th>Connection</th><th>Game status</th><th>Eliminations</th><th>Action</th></tr></thead>
     <tbody id="players"><tr><td colspan="5">Loading…</td></tr></tbody>
   </table>
+  <h2>🗺️ Dungeon Map</h2>
+  <div id="dungeon" aria-live="polite"><div id="dungeon-map">Loading dungeon map…</div></div>
   <h2>Folder tree</h2>
   <div id="tree" aria-live="polite">Loading folders…</div>
   <script>
     const body = document.getElementById("players");
     const tree = document.getElementById("tree");
+    const dungeonMap = document.getElementById("dungeon-map");
     const status = document.getElementById("status");
     const resetButton = document.getElementById("reset");
     async function postAdminAction(path, password, payload) {
@@ -91,6 +97,20 @@ PAGE = """<!doctype html>
         const response = await fetch("/api/scoreboard", { cache: "no-store" });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
+        
+        // Fetch and display dungeon map
+        try {
+          const dungeonResponse = await fetch("/api/dungeon", { cache: "no-store" });
+          if (dungeonResponse.ok) {
+            const dungeonData = await dungeonResponse.json();
+            if (dungeonData.map_ascii) {
+              dungeonMap.textContent = dungeonData.map_ascii;
+            }
+          }
+        } catch (error) {
+          console.error("Dungeon fetch failed:", error);
+        }
+        
         const folderList = document.createElement("ul");
         folderList.append(renderTree(data.tree));
         tree.replaceChildren(folderList);
@@ -195,6 +215,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_response(503)
             else:
                 self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/api/dungeon":
+            try:
+                player_locations = game_state.get_all_player_locations()
+                # Get jails from database
+                connection = game_state.connect()
+                jails = [row[0] for row in connection.execute(
+                    "SELECT folder_path FROM jails"
+                ).fetchall()]
+                connection.close()
+                
+                dungeon_data = dungeon_viz.create_compact_dungeon_visualization(player_locations)
+                dungeon_data["jails"] = jails
+                dungeon_data["map_ascii"] = dungeon_viz.create_dungeon_map(player_locations, jails)
+                
+                body = json.dumps(dungeon_data).encode("utf-8")
+                self.send_response(200)
+            except Exception as exc:
+                self.log_error("dungeon visualization error: %s", exc)
+                body = b'{"error":"dungeon unavailable"}'
+                self.send_response(503)
+            
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")

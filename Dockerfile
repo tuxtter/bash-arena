@@ -9,6 +9,7 @@ COPY sshd_config /etc/ssh/sshd_config
 COPY bashgame_shell.py /usr/local/bin/bashgame-shell
 COPY game_state.py /usr/local/bin/game_state.py
 COPY bashgame_dashboard.py /usr/local/bin/bashgame_dashboard.py
+COPY dungeon_viz.py /usr/local/bin/dungeon_viz.py
 COPY bashgame-entrypoint /usr/local/sbin/bashgame-entrypoint
 
 RUN chmod 0755 /usr/local/bin/bashgame-shell /usr/local/bin/bashgame_dashboard.py /usr/local/sbin/bashgame-entrypoint
